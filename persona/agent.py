@@ -148,34 +148,41 @@ def qr_to_vcard_or_url(image_bytes: bytes, mime_type: str | None = None) -> dict
 
     return {"status": "success", "linkedin_url": text}
 
-def render_prompt_from_json(profile: dict) -> dict:
+def render_prompt_from_json(profile: dict, extra_context: str | None = None) -> dict:
     """
-    Turn profile JSON → natural-language prompt for the dialogue agent.
+    Turn profile JSON into persona instructions for a live conversation agent.
     """
-    name = profile.get("name")
-    company = profile.get("company")
-    position = profile.get("position")
-    location = profile.get("location")
+    name = profile.get("name") or "Recruiter"
+    position = profile.get("position") or "Recruiter"
+    company = profile.get("company") or "Company"
+    location = profile.get("location") or "United States"
 
-    parts = []
+    instructions = f"""
+    You are {name}, {position} at {company}, located in {location}.
+    You are interviewing a candidate at a college job fair who has expressed interest in joining the firm.
+    Please ask questions {name} would be likely to ask given their background.
 
-    if name:
-        parts.append(name)
-    if position:
-        parts.append(position)
-    if company:
-        parts.append(f"at {company}")
-    if location:
-        parts.append(f"in {location}")
+    Rules:
+    - Focus on early-career talent (this is a college fair).
+    -Generate replies based off of your position. For example, if you are software engineering, offer insights about a framework; If you are a product manager, for example, give insights about agile principles
+    - Keep replies short and professional (target ~3 minutes).
+    - No markdown/emoji, use plain English.
+    - If you’re unsure, ground yourself first (google_search tool).
+    - End with "\\END_CONVERSATION\\" and feedback on the candidate’s performance.
+    {extra_context or ""}
+    """.strip()
 
-    subject = " ".join(parts) if parts else "a professional contact"
-
-    prompt = (
-        f"Prepare a concise, warm outreach message to {subject}. "
-        "Ask one specific question tied to their role or program, and one about how candidates can stand out. "
-        "Avoid fluff; keep it to 3–4 sentences."
-    )
-    return {"status": "success", "prompt_text": prompt}
+    return {
+        "status": "success",
+        "persona_instructions": instructions,
+        "profile": {
+            "name": name,
+            "position": position,
+            "company": company,
+            "location": location,
+            "url": profile.get("url"),
+        },
+    }
 
 # ------------------ LinkedIn scraper wrapper ------------------
 

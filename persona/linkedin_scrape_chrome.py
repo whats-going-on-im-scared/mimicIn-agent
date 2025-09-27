@@ -164,8 +164,9 @@ def scroll_to_experience(driver, tries=3):
 def extract_position_and_company_from_experience(driver):
     """
     1) Scroll to Experience (authoritative source).
-    2) First <li>: role = first non-empty line.
-       company = first subsequent line that doesn't look like dates/location; strip trailing ' · ...'.
+    2) Detect two patterns:
+       A) Single-role card: lines[0]=role, next non-meta is company.
+       B) Company-group card: lines[0]=company, next title-like non-meta is role.
     """
     exp_section = scroll_to_experience(driver)
     if exp_section is None:
@@ -178,42 +179,80 @@ def extract_position_and_company_from_experience(driver):
     except Exception:
         return None, None
 
-    # Full visible text of the first card; LinkedIn often splits text across nested spans.
+    # Pull visible text and normalize
     lines = [ln.strip() for ln in (first_li.text or "").splitlines() if ln.strip()]
     if not lines:
         return None, None
 
-    # ROLE = first line
-    role = lines[0]
-
-    # Helper to decide if a line is dates/location/work-mode junk
     def is_meta(line: str) -> bool:
+        # Dates/durations/Present or location / work-mode / misc badges
         l = line.lower()
-        if l.startswith("helped me get this job") or l.startswith("currently hiring") or l.startswith("soon to be hiring") or l.startswith("filled"):
+        if l.startswith(("helped me get this job", "currently hiring", "soon to be hiring", "filled")):
             return True
-        # date-ish or duration-ish: has digits and '-' or 'Present' or 'mos/yrs'
         has_digit = any(c.isdigit() for c in line)
-        if has_digit and ("-" in line or "Present" in line or "mos" in l or "yr" in l):
+        if has_digit and ("-" in line or "–" in line or "present" in l or "mos" in l or "yr" in l or "yrs" in l):
             return True
-        # location/work mode markers
-        bad_markers = ("United States", "Remote", "Hybrid", "On-site", "On site")
-        if any(m in line for m in bad_markers):
+        if any(m in line for m in ("United States", "Remote", "Hybrid", "On-site", "On site")):
+            return True
+        # “Internship · 4 mos” style summary is meta
+        if " · " in line and any(tok in l for tok in ("internship", "contract", "full-time", "part-time", "apprentice", "co-op")):
             return True
         return False
 
-    company = None
-    # Find the first candidate line after role
-    for ln in lines[1:]:
-        if is_meta(ln):
-            continue
-        cand = ln.split("·", 1)[0].strip()  # keep text before " · "
-        if cand and cand.lower() != role.lower():
-            company = cand
-            break
+    def looks_like_title(txt: str) -> bool:
+        title_words = (
+            "Recruiter","Engineer","Manager","Intern","Specialist","Director","Lead","Sr","Senior","Staff",
+            "Associate","Scientist","Designer","Consultant","Analyst","Architect","Owner","Founder","Executive",
+            "Officer","Developer","Administrator","Coordinator","Assistant","Engineer I","Engineer II"
+        )
+        t = txt.lower()
+        return any(w.lower() in t for w in title_words)
 
-    position = clean(role)
+    # ---------- Detect layout ----------
+    # Heuristic: if first line does NOT look like a title and is not meta,
+    # treat it as a Company header (Layout B). Otherwise, Layout A.
+    first = lines[0]
+    layout_grouped_company = (not looks_like_title(first)) and (not is_meta(first))
+
+    role = None
+    company = None
+
+    if layout_grouped_company:
+        # Layout B: lines[0] is company; find the first title-like non-meta line after it
+        company = first.split("·", 1)[0].strip()
+        for ln in lines[1:]:
+            if is_meta(ln):
+                continue
+            # Skip obvious section labels like "Experience" (defensive)
+            if ln.lower() == "experience":
+                continue
+            if looks_like_title(ln):
+                role = ln
+                break
+        # Fallback: if we never found a title-like line, treat the next non-meta as role
+        if not role:
+            for ln in lines[1:]:
+                if not is_meta(ln):
+                    role = ln
+                    break
+    else:
+        # Layout A: first line is role; find next non-meta as company (and not same as role)
+        role = first
+        for ln in lines[1:]:
+            if is_meta(ln):
+                continue
+            cand = ln.split("·", 1)[0].strip()
+            if cand and cand.lower() != role.lower():
+                company = cand
+                break
+
+        # Extra guard: if company accidentally looks like a title (rare), swap
+        if company and looks_like_title(company) and not looks_like_title(role):
+            role, company = company, role
+
+    role = clean(role)
     company = clean(company) if company else None
-    return position, company
+    return role, company
 
 def scrape_profile(driver, profile_url: str):
     driver.get(profile_url)
