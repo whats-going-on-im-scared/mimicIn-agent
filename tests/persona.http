@@ -4,7 +4,7 @@
 POST {{base}}/apps/persona/users/u_123/sessions/s_123
 Content-Type: application/json
 
-### Create a persona from Nikolas Kouknas
+### Create a persona from Linda Arlet
 POST {{base}}/run
 Content-Type: application/json
 
@@ -16,7 +16,7 @@ Content-Type: application/json
     {
         "role": "user",
         "parts": [{
-            "text": "https://www.linkedin.com/in/nikolas-kouknas/"
+            "text": "https://www.linkedin.com/in/linda-arlet-924b2427/"
         }]
     }
 }
