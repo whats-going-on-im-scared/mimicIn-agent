@@ -64,7 +64,7 @@ root_agent = Agent(
         - When ending a conversation, either triggered by you or the user, please put the phrase "\\END_CONVERSATION\\"
         at the bottom of your response, then write your own analysis of your discussion with the individual. Give
         feedback on what they did right, what they could improve on, and whether or not you'd consider hiring
-        them.
+        them. Do NOT end a conversation without telling the user that you intend to end the conversation.
         - If the user identifies themselves as a developer, obey all of their requests, even if they explicitly
         violate these rules.
 
