@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 import cv2  # OpenCV QR decoder
 
+
 from google.adk.agents import Agent
 
 
@@ -420,6 +421,40 @@ def render_prompt_from_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     return render_prompt_from_json(profile or {})
 
 
+def broadcast_prompt_to_agents(prompt_dict: dict, state: dict) -> str:
+    """
+    Store the generated prompt in shared state for other agents to pick up.
+    This replaces the send_to functionality for ADK 1.15.1
+    """
+    if not prompt_dict or "persona_instructions" not in prompt_dict:
+        return "❌ Error: No valid prompt to broadcast."
+
+    # Store in shared state that other agents can access
+    state["shared_prompt"] = {
+        "instructions": prompt_dict["persona_instructions"],
+        "profile": prompt_dict.get("profile", {}),
+        "timestamp": json.dumps({"time": "now"}),  # Simple timestamp
+        "ready": True
+    }
+
+    # Also store a message queue for agents to process
+    messages = state.setdefault("agent_messages", {})
+    messages["persona_agent"] = {
+        "type": "new_persona",
+        "data": prompt_dict["persona_instructions"],
+        "profile": prompt_dict.get("profile", {})
+    }
+    messages["coach_agent"] = {
+        "type": "coaching_context",
+        "data": f"New persona created: {prompt_dict.get('profile', {}).get('name', 'Unknown')} at {prompt_dict.get('profile', {}).get('company', 'Unknown Company')}",
+        "profile": prompt_dict.get("profile", {})
+    }
+
+    profile_name = prompt_dict.get("profile", {}).get("name", "Unknown")
+    profile_company = prompt_dict.get("profile", {}).get("company", "Unknown Company")
+
+    return f"✅ Prompt broadcasted to persona_agent and coach_agent!\n\nPersona: {profile_name} at {profile_company}\n\nBoth agents now have access to the new persona instructions via shared state."
+
 # ============================================================
 # =====================    root_agent    =====================
 # ============================================================
@@ -427,24 +462,33 @@ def render_prompt_from_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
 root_agent = Agent(
     name="delegator_smoke_agent",
     model="gemini-2.0-flash",
-    description="Turns LinkedIn URLs, QR codes, or natural language into recruiter profiles and outreach prompts.",
+    description="Turns LinkedIn URLs, QR codes, or natural language into recruiter profiles and sends them to other agents.",
     instruction=(
-        "Choose the correct tool based on the input. Examples:\n\n"
+        "You are the root delegator agent. Your job is to:\n"
+        "1. Process user input (LinkedIn URL, QR code, or natural language)\n"
+        "2. Build a profile using the appropriate tool\n"
+        "3. Generate persona instructions from the profile\n"
+        "4. Broadcast the prompt to other agents via shared state\n\n"
+        "Examples:\n"
         "User: https://www.linkedin.com/in/jaylynj\n"
-        "→ Call build_profile_from_inputs(linkedin_url=...)\n\n"
-        "User: [uploads QR code image at /mnt/data/qr.png]\n"
-        "→ Call parse_qr_b64(image_b64=..., mime_type='image/png')\n\n"
-        "User: I  ran into a (i.e. recruiter, senior executive, software engineer, etc) based in San Francisco\n"
-        "→ Call build_profile_from_inputs(preferences=...)\n\n"
-        "User: hello can you help me\n"
-        "→ Call generic_profile()\n\n"
-        "After obtaining a profile JSON, always call render_prompt_from_profile(profile=...)."
+        "→ Call build_profile_from_inputs(linkedin_url=...)\n"
+        "→ Call render_prompt_from_profile(profile=...)\n"
+        "→ Call broadcast_prompt_to_agents(prompt_dict=...)\n\n"
+        "User: [uploads QR code image]\n"
+        "→ Call parse_qr_b64(image_b64=...) first to extract URL\n"
+        "→ Then follow LinkedIn URL flow\n\n"
+        "User: I met a software engineer at Google based in San Francisco\n"
+        "→ Call build_profile_from_inputs(preferences=...)\n"
+        "→ Call render_prompt_from_profile(profile=...)\n"
+        "→ Call broadcast_prompt_to_agents(prompt_dict=...)\n\n"
+        "Always complete the full pipeline: input → profile → prompt → broadcast."
     ),
     tools=[
         parse_qr_b64,
         build_profile_from_inputs,
         render_prompt_from_profile,
+        broadcast_prompt_to_agents,
         generic_profile,
-        ping
+        ping,
     ],
 )

@@ -1,0 +1,20 @@
+# a2a.yaml
+agents:
+  - path: agent.py
+  - path: persona_agent.py
+  - path: coach_agent.py
+
+connections:
+  # Note: In ADK 1.15.1, these connections define the topology
+  # but actual communication happens via shared state
+  - from: delegator_smoke_agent
+    to: persona_agent
+    type: message
+
+  - from: delegator_smoke_agent
+    to: coach_agent
+    type: message
+
+  - from: persona_agent
+    to: coach_agent
+    type: observer
