@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-LinkedIn Profile Scraper (Chrome/Selenium)
+LinkedIn Profile Screenshot Scraper with LLM Integration
 
-Extracts: name, position (from first Experience item), company (from first Experience item), location
+Takes screenshots of LinkedIn profiles and uses Gemini 2.0 to extract information.
 
 Usage:
-  python linkedin_profile_scrape_chrome.py "https://www.linkedin.com/in/USERNAME/" \
-      --email you@example.com --password 'secret' --headless --output profile.json
+  python linkedin_screenshot_scraper.py "https://www.linkedin.com/in/USERNAME/" \
+      --email you@example.com --password 'secret' --gemini-api-key YOUR_API_KEY \
+      --headless --output profile.json
 
 If Selenium Manager can't fetch ChromeDriver (blocked network), download a matching
 chromedriver.exe and pass --chromedriver "C:\\path\\to\\chromedriver.exe"
 """
 
 import argparse
+import base64
 import json
 import os
 import random
 import sys
 import time
 from pathlib import Path
+from io import BytesIO
 
+import google.generativeai as genai
+from PIL import Image
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -31,61 +36,34 @@ from selenium.webdriver.support import expected_conditions as EC
 
 # --------- small helpers ---------
 def jitter(a=0.5, b=1.2):
+    """Random delay to appear more human-like"""
     time.sleep(random.uniform(a, b))
 
 
 def wait_for(driver, locator, timeout=25):
+    """Wait for element to be present"""
     return WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
-
-
-def safe_text(driver, by, value, context=None, timeout=8):
-    base = context or driver
-    try:
-        elem = WebDriverWait(base, timeout).until(EC.presence_of_element_located((by, value)))
-        txt = (elem.text or "").strip()
-        return txt or None
-    except Exception:
-        return None
-
-
-def clean(s, max_len=300):
-    if not s:
-        return None
-    s = " ".join(s.split())
-    return s[:max_len]
-
-
-def looks_like_title(txt: str) -> bool:
-    """Heuristic to avoid misclassifying a title as company."""
-    title_words = (
-        "Recruiter", "Engineer", "Manager", "Intern", "Specialist",
-        "Director", "Lead", "Sr", "Senior", "Staff", "Associate",
-        "Scientist", "Designer", "Consultant", "Analyst", "Architect",
-    )
-    t = txt.lower()
-    return any(w.lower() in t for w in title_words)
-
-
-def bad_company_marker(txt: str) -> bool:
-    for m in ("United States", "Remote", "Hybrid", "On-site", "On site"):
-        if m in txt:
-            return True
-    return False
 
 
 # --------- driver setup ----------
 def init_driver(headless: bool, chromedriver_path: str | None):
+    """Initialize Chrome driver with optimized settings"""
     opts = ChromeOptions()
-    # stability/noise reduction flags
+
+    # Stability/noise reduction flags
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-features=VizDisplayCompositor")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option('useAutomationExtension', False)
+
+    # Set window size for consistent screenshots
+    opts.add_argument("--window-size=1920,1080")
 
     if headless:
         opts.add_argument("--headless=new")
-        # use explicit window-size with headless
-        opts.add_argument("--window-size=1280,800")
 
     if chromedriver_path:
         service = ChromeService(executable_path=chromedriver_path, log_output="chromedriver.log")
@@ -95,12 +73,19 @@ def init_driver(headless: bool, chromedriver_path: str | None):
         driver = webdriver.Chrome(options=opts)
 
     driver.set_page_load_timeout(45)
+
+    # Set viewport size
+    driver.execute_script("window.scrollTo(0, 0);")
+
     return driver
 
 
-# --------- login + scraping -------
+# --------- login functionality -------
 def login(driver, email: str, password: str):
+    """Login to LinkedIn"""
+    print("Logging in to LinkedIn...")
     driver.get("https://www.linkedin.com/login")
+
     wait_for(driver, (By.ID, "username"))
     driver.find_element(By.ID, "username").clear()
     driver.find_element(By.ID, "username").send_keys(email)
@@ -113,178 +98,255 @@ def login(driver, email: str, password: str):
         lambda d: any(s in d.current_url for s in ("/feed", "/in/", "/checkpoint", "login-submit"))
     )
     jitter()
+    print("Login successful!")
 
 
-# --- name/location from top card (do NOT use headline for position) ---
-def extract_name_location(driver):
-    # Name
-    name = safe_text(
-        driver, By.XPATH,
-        "//h1[contains(@class,'text-heading-xlarge') or contains(@class,'text-heading-large')]"
-    ) or safe_text(
-        driver, By.XPATH,
-        "//main//section[.//h1]//h1"
-    )
-
-    # Location: primary + fallback
-    location = safe_text(
-        driver, By.XPATH,
-        "//span[contains(@class,'text-body-small') and contains(@class,'inline') and contains(@class,'break-words')]"
-    ) or safe_text(
-        driver, By.XPATH,
-        "//div[contains(@class,'pv-text-details__left-panel')]//span[contains(@class,'text-body-small')]"
-    )
-
-    return clean(name), clean(location)
-
-def scroll_to_experience(driver, tries=3):
+# --------- screenshot functionality -------
+def take_full_page_screenshot(driver, output_path: str = None):
     """
-    Robustly scrolls the Experience section into view.
-    Tries: find the <section> whose H2 contains 'Experience', then scrollIntoView.
-    Falls back to incremental page scrolls if needed.
+    Take a full page screenshot using Chrome DevTools Protocol
+    Returns: bytes of the screenshot
     """
-    for attempt in range(tries):
-        try:
-            sec = WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//section[.//h2//span[contains(.,'Experience')]]")
-                )
+    # Get dimensions
+    total_height = driver.execute_script("return document.body.scrollHeight")
+    viewport_height = driver.execute_script("return window.innerHeight")
+
+    screenshots = []
+
+    # Scroll to top
+    driver.execute_script("window.scrollTo(0, 0);")
+    jitter(0.5, 1.0)
+
+    # Calculate number of screenshots needed
+    num_screenshots = (total_height // viewport_height) + 1
+
+    for i in range(num_screenshots):
+        # Take screenshot
+        screenshot = driver.get_screenshot_as_png()
+        screenshots.append(Image.open(BytesIO(screenshot)))
+
+        # Scroll down
+        scroll_position = min((i + 1) * viewport_height, total_height - viewport_height)
+        driver.execute_script(f"window.scrollTo(0, {scroll_position});")
+        jitter(0.3, 0.6)
+
+    # Stitch screenshots together
+    total_width = screenshots[0].width
+    stitched = Image.new('RGB', (total_width, total_height))
+
+    y_offset = 0
+    for img in screenshots:
+        stitched.paste(img, (0, y_offset))
+        y_offset += img.height
+
+    # Save if output path provided
+    if output_path:
+        stitched.save(output_path)
+        print(f"Screenshot saved to {output_path}")
+
+    # Convert to bytes
+    img_byte_arr = BytesIO()
+    stitched.save(img_byte_arr, format='PNG')
+    img_byte_arr.seek(0)
+
+    return img_byte_arr.getvalue()
+
+
+def take_section_screenshots(driver):
+    """
+    Take strategic screenshots of important sections
+    Returns: dict with section names and screenshot bytes
+    """
+    screenshots = {}
+
+    # 1. Profile header screenshot
+    driver.execute_script("window.scrollTo(0, 0);")
+    jitter(0.5, 1.0)
+    screenshots['header'] = driver.get_screenshot_as_png()
+
+    # 2. Experience section screenshot
+    try:
+        exp_section = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//section[.//h2//span[contains(text(),'Experience')]]")
             )
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", sec)
-            jitter(0.6, 1.0)
-            # Wait for first item to render
-            WebDriverWait(sec, 8).until(EC.presence_of_element_located((By.XPATH, ".//li[1]")))
-            return sec
-        except Exception:
-            # gentle incremental scroll fallback
-            driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.6));")
-            jitter(0.6, 1.0)
-    return None
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'start'});", exp_section)
+        jitter(0.5, 1.0)
+        screenshots['experience'] = driver.get_screenshot_as_png()
+    except Exception as e:
+        print(f"Could not find Experience section: {e}")
 
-def extract_position_and_company_from_experience(driver):
+    # 3. Education section screenshot (if exists)
+    try:
+        edu_section = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//section[.//h2//span[contains(text(),'Education')]]")
+            )
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'start'});", edu_section)
+        jitter(0.5, 1.0)
+        screenshots['education'] = driver.get_screenshot_as_png()
+    except Exception:
+        print("Education section not found or not accessible")
+
+    # 4. Skills section screenshot (if exists)
+    try:
+        skills_section = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//section[.//h2//span[contains(text(),'Skills')]]")
+            )
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'start'});", skills_section)
+        jitter(0.5, 1.0)
+        screenshots['skills'] = driver.get_screenshot_as_png()
+    except Exception:
+        print("Skills section not found or not accessible")
+
+    return screenshots
+
+
+# --------- Gemini integration -------
+def setup_gemini(api_key: str):
+    """Initialize Gemini API"""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+    return model
+
+
+def analyze_with_gemini(model, screenshots: dict, profile_url: str):
     """
-    1) Scroll to Experience (authoritative source).
-    2) Detect two patterns:
-       A) Single-role card: lines[0]=role, next non-meta is company.
-       B) Company-group card: lines[0]=company, next title-like non-meta is role.
+    Send screenshots to Gemini for analysis
     """
-    exp_section = scroll_to_experience(driver)
-    if exp_section is None:
-        return None, None
+    print("Analyzing screenshots with Gemini 2.0...")
+
+    # Prepare images for Gemini
+    images = []
+    for section_name, screenshot_bytes in screenshots.items():
+        img = Image.open(BytesIO(screenshot_bytes))
+        images.append(img)
+
+    # Craft the prompt
+    prompt = """
+    Analyze these LinkedIn profile screenshots and extract the following information in JSON format:
+
+    {
+        "name": "Full name of the person",
+        "position": "Current job title/position (from most recent experience)",
+        "company": "Current company name (from most recent experience)",
+        "location": "Location/city",
+        "summary": "Brief professional summary if visible",
+        "experience": [
+            {
+                "title": "Job title",
+                "company": "Company name",
+                "duration": "Time period",
+                "description": "Brief description if available"
+            }
+        ],
+        "education": [
+            {
+                "degree": "Degree name",
+                "institution": "School/University name",
+                "year": "Graduation year or period"
+            }
+        ],
+        "skills": ["List of skills if visible"],
+        "additional_info": "Any other relevant information"
+    }
+
+    Please provide accurate information based only on what's visible in the screenshots.
+    If a field is not visible or unclear, use null for that field.
+    Focus on extracting the most recent/current position and company for the main position and company fields.
+    """
 
     try:
-        first_li = WebDriverWait(exp_section, 10).until(
-            EC.presence_of_element_located((By.XPATH, ".//li[1]"))
-        )
-    except Exception:
-        return None, None
+        # Send to Gemini
+        response = model.generate_content([prompt] + images)
 
-    # Pull visible text and normalize
-    lines = [ln.strip() for ln in (first_li.text or "").splitlines() if ln.strip()]
-    if not lines:
-        return None, None
+        # Parse the response
+        response_text = response.text
 
-    def is_meta(line: str) -> bool:
-        # Dates/durations/Present or location / work-mode / misc badges
-        l = line.lower()
-        if l.startswith(("helped me get this job", "currently hiring", "soon to be hiring", "filled")):
-            return True
-        has_digit = any(c.isdigit() for c in line)
-        if has_digit and ("-" in line or "–" in line or "present" in l or "mos" in l or "yr" in l or "yrs" in l):
-            return True
-        if any(m in line for m in ("United States", "Remote", "Hybrid", "On-site", "On site")):
-            return True
-        # “Internship · 4 mos” style summary is meta
-        if " · " in line and any(tok in l for tok in ("internship", "contract", "full-time", "part-time", "apprentice", "co-op")):
-            return True
-        return False
+        # Try to extract JSON from the response
+        # Gemini might return JSON wrapped in markdown code blocks
+        if "```json" in response_text:
+            json_start = response_text.index("```json") + 7
+            json_end = response_text.index("```", json_start)
+            json_str = response_text[json_start:json_end].strip()
+        elif "```" in response_text:
+            json_start = response_text.index("```") + 3
+            json_end = response_text.index("```", json_start)
+            json_str = response_text[json_start:json_end].strip()
+        else:
+            # Assume the entire response is JSON
+            json_str = response_text.strip()
 
-    def looks_like_title(txt: str) -> bool:
-        title_words = (
-            "Recruiter","Engineer","Manager","Intern","Specialist","Director","Lead","Sr","Senior","Staff",
-            "Associate","Scientist","Designer","Consultant","Analyst","Architect","Owner","Founder","Executive",
-            "Officer","Developer","Administrator","Coordinator","Assistant","Engineer I","Engineer II"
-        )
-        t = txt.lower()
-        return any(w.lower() in t for w in title_words)
+        # Parse JSON
+        profile_data = json.loads(json_str)
+        profile_data['url'] = profile_url
 
-    # ---------- Detect layout ----------
-    # Heuristic: if first line does NOT look like a title and is not meta,
-    # treat it as a Company header (Layout B). Otherwise, Layout A.
-    first = lines[0]
-    layout_grouped_company = (not looks_like_title(first)) and (not is_meta(first))
+        return profile_data
 
-    role = None
-    company = None
+    except json.JSONDecodeError as e:
+        print(f"Error parsing Gemini response as JSON: {e}")
+        print(f"Raw response: {response_text[:500]}...")
+        # Return a basic structure with the raw response
+        return {
+            "error": "Failed to parse Gemini response",
+            "raw_response": response_text,
+            "url": profile_url
+        }
+    except Exception as e:
+        print(f"Error communicating with Gemini: {e}")
+        return {
+            "error": str(e),
+            "url": profile_url
+        }
 
-    if layout_grouped_company:
-        # Layout B: lines[0] is company; find the first title-like non-meta line after it
-        company = first.split("·", 1)[0].strip()
-        for ln in lines[1:]:
-            if is_meta(ln):
-                continue
-            # Skip obvious section labels like "Experience" (defensive)
-            if ln.lower() == "experience":
-                continue
-            if looks_like_title(ln):
-                role = ln
-                break
-        # Fallback: if we never found a title-like line, treat the next non-meta as role
-        if not role:
-            for ln in lines[1:]:
-                if not is_meta(ln):
-                    role = ln
-                    break
-    else:
-        # Layout A: first line is role; find next non-meta as company (and not same as role)
-        role = first
-        for ln in lines[1:]:
-            if is_meta(ln):
-                continue
-            cand = ln.split("·", 1)[0].strip()
-            if cand and cand.lower() != role.lower():
-                company = cand
-                break
 
-        # Extra guard: if company accidentally looks like a title (rare), swap
-        if company and looks_like_title(company) and not looks_like_title(role):
-            role, company = company, role
-
-    role = clean(role)
-    company = clean(company) if company else None
-    return role, company
-
-def scrape_profile(driver, profile_url: str):
+# --------- main scraping function -------
+def scrape_profile(driver, profile_url: str, gemini_model, save_screenshots: bool = False):
+    """
+    Navigate to profile, take screenshots, and analyze with Gemini
+    """
+    print(f"Navigating to profile: {profile_url}")
     driver.get(profile_url)
+
+    # Wait for main content to load
     wait_for(driver, (By.TAG_NAME, "main"))
-    jitter()
+    jitter(2, 3)  # Give extra time for content to fully render
 
-    # Top card: name + location only
-    name, location = extract_name_location(driver)
+    # Take screenshots
+    print("Taking screenshots...")
+    screenshots = take_section_screenshots(driver)
 
-    # Experience: position + company (authoritative)
-    position, company = extract_position_and_company_from_experience(driver)
+    # Optionally save screenshots locally
+    if save_screenshots:
+        timestamp = int(time.time())
+        for section_name, screenshot_bytes in screenshots.items():
+            filename = f"linkedin_{section_name}_{timestamp}.png"
+            with open(filename, 'wb') as f:
+                f.write(screenshot_bytes)
+            print(f"Saved {filename}")
 
-    return {
-        "name": name,
-        "position": position,
-        "company": company,
-        "location": location,
-        "url": profile_url,
-    }
+    # Analyze with Gemini
+    profile_data = analyze_with_gemini(gemini_model, screenshots, profile_url)
+
+    return profile_data
 
 
 # ---------- CLI -------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="LinkedIn profile scraper (Chrome)")
+    p = argparse.ArgumentParser(description="LinkedIn profile screenshot scraper with Gemini 2.0")
     p.add_argument("profile_url", help="Full LinkedIn profile URL, e.g. https://www.linkedin.com/in/USERNAME/")
     p.add_argument("--email", help="LinkedIn email (fallback to .env EMAIL)")
     p.add_argument("--password", help="LinkedIn password (fallback to .env PASSWORD)")
+    p.add_argument("--gemini-api-key", help="Gemini API key (fallback to .env GOOGLE_API_KEY)")
     p.add_argument("--headless", action="store_true", help="Run Chrome in headless mode")
     p.add_argument("--output", "-o", help="Write JSON to this file")
+    p.add_argument("--save-screenshots", action="store_true", help="Save screenshots locally")
     p.add_argument("--chromedriver", help="Path to chromedriver.exe if Selenium Manager is blocked")
     return p.parse_args()
-
 
 def main():
     load_dotenv()
@@ -292,23 +354,45 @@ def main():
     args = parse_args()
     email = args.email or os.getenv("EMAIL")
     password = args.password or os.getenv("PASSWORD")
+    # fix here
+    google_api_key = args.gemini_api_key or os.getenv("GOOGLE_API_KEY")
 
     if not email or not password:
-        print("ERROR: Missing credentials. Provide --email/--password or set EMAIL and PASSWORD in .env", file=sys.stderr)
+        print("ERROR: Missing credentials. Provide --email/--password or set EMAIL and PASSWORD in .env",
+              file=sys.stderr)
+        sys.exit(2)
+
+    if not google_api_key:
+        print("ERROR: Missing Gemini API key. Provide --gemini-api-key or set GOOGLE_API_KEY in .env",
+              file=sys.stderr)
         sys.exit(2)
 
     driver = None
     try:
-        driver = init_driver(headless=args.headless, chromedriver_path=args.chromedriver)
-        login(driver, email, password)
-        data = scrape_profile(driver, args.profile_url)
+        # Initialize Gemini
+        gemini_model = setup_gemini(google_api_key)
 
+        # Initialize driver
+        driver = init_driver(headless=args.headless, chromedriver_path=args.chromedriver)
+
+        # Login to LinkedIn
+        login(driver, email, password)
+
+        # Scrape profile
+        data = scrape_profile(driver, args.profile_url, gemini_model, args.save_screenshots)
+
+        # Output results
         if args.output:
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"Results saved to {args.output}")
         else:
             print(json.dumps(data, ensure_ascii=False, indent=2))
+
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
     finally:
         if driver:
             try:

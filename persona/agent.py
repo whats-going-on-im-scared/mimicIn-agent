@@ -16,9 +16,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 import cv2  # OpenCV QR decoder
 
-
 from google.adk.agents import Agent
-
 
 # ============================================================
 # =============  (moved from profile_tools.py)  ==============
@@ -41,51 +39,6 @@ _LINKEDIN_PROFILE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# add near your other tool wrappers in agent.py
-
-def ingest_any(
-    text=None,
-    url=None,
-    image_b64=None,
-    image_path=None,
-    mime_type="image/png",
-    email=None,
-    password=None,
-    headless=True,
-    chromedriver=None,
-):
-    """
-    Unified entrypoint:
-      - If image_b64 is present => try QR -> LinkedIn -> scrape
-      - elif url is present     => scrape LinkedIn
-      - elif text is present    => NL -> JSON (heuristics)
-      - else                    => generic profile
-    """
-    kwargs = {
-        "linkedin_url": url,
-        "preferences": text,
-        "email": email,
-        "password": password,
-        "headless": headless,
-        "chromedriver": chromedriver,
-        "mime_type": mime_type,
-    }
-
-    if image_path:
-        try:
-            with open(image_path, "rb") as f:
-                kwargs["image_bytes"] = f.read()
-        except Exception as e:
-            return {"error": f"Failed to read image_path: {e}"}
-
-    if image_b64:
-        try:
-            from base64 import b64decode
-            kwargs["image_bytes"] = b64decode(image_b64, validate=True)
-        except Exception as e:
-            return {"error": f"Invalid base64 image: {e}"}
-
-    return build_profile(kwargs)
 
 def _is_linkedin_profile_url(url: str) -> bool:
     return bool(_LINKEDIN_PROFILE_RE.match((url or "").strip()))
@@ -98,6 +51,7 @@ def _bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
     rgb = np.array(pil)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     return bgr
+
 
 def _decode_qr_cv2(image_bytes: bytes) -> Optional[str]:
     """Return first decoded QR string or None."""
@@ -121,15 +75,11 @@ def _decode_qr_cv2(image_bytes: bytes) -> Optional[str]:
 # ------------------ Tools ------------------
 
 def qr_to_vcard_or_url(image_bytes: bytes, mime_type: str | None = None) -> dict:
-    # LinkedIn-only QR decoder (no vCard support).
-
     try:
-        decoded = _decode_qr_cv2(image_bytes)   # this calls Image.open(...) under the hood
+        decoded = _decode_qr_cv2(image_bytes)
     except UnidentifiedImageError:
-        # Not a valid image file – return a clean error instead of crashing
         return {"status": "error", "message": "Invalid image data: not a recognizable image."}
     except Exception:
-        # Any other unexpected decode failure
         return {"status": "error", "message": "Unable to decode QR from the provided image."}
 
     if not decoded:
@@ -148,6 +98,7 @@ def qr_to_vcard_or_url(image_bytes: bytes, mime_type: str | None = None) -> dict
         return {"status": "error", "message": "We only accept LinkedIn profile URLs at the moment."}
 
     return {"status": "success", "linkedin_url": text}
+
 
 def render_prompt_from_json(profile: dict, extra_context: str | None = None) -> dict:
     """
@@ -168,8 +119,8 @@ def render_prompt_from_json(profile: dict, extra_context: str | None = None) -> 
     -Generate replies based off of your position. For example, if you are software engineering, offer insights about a framework; If you are a product manager, for example, give insights about agile principles
     - Keep replies short and professional (target ~3 minutes).
     - No markdown/emoji, use plain English.
-    - If you’re unsure, ground yourself first (google_search tool).
-    - End with "\\END_CONVERSATION\\" and feedback on the candidate’s performance.
+    - If you're unsure, ground yourself first (google_search tool).
+    - End with "\\END_CONVERSATION\\" and feedback on the candidate's performance.
     {extra_context or ""}
     """.strip()
 
@@ -185,21 +136,28 @@ def render_prompt_from_json(profile: dict, extra_context: str | None = None) -> 
         },
     }
 
+
 # ------------------ LinkedIn scraper wrapper ------------------
 
 def linkedin_profile_extractor(
-    linkedin_url: str,
-    email: Optional[str] = None,
-    password: Optional[str] = None,
-    headless: bool = True,
-    chromedriver: Optional[str] = None,
+        linkedin_url: str,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
+        headless: bool = True,
+        chromedriver: Optional[str] = None,
 ) -> dict:
     """
     Wraps linkedin_scrape_chrome.py (Selenium). Returns:
       { "name": ..., "position": ..., "company": ..., "location": ..., "url": ... }
       or { "error": "..." }
     """
-    if not _is_linkedin_profile_url(linkedin_url):
+    # Normalize missing scheme like "linkedin.com/in/slug" before validation
+    normalized_url = linkedin_url.strip()
+    lower = normalized_url.lower()
+    if lower.startswith("linkedin.com/") or lower.startswith("www.linkedin.com/"):
+        normalized_url = "https://" + normalized_url
+
+    if not _is_linkedin_profile_url(normalized_url):
         return {"error": "Invalid LinkedIn profile URL."}
 
     # Resolve script path (repo local first, then /mnt/data)
@@ -219,7 +177,7 @@ def linkedin_profile_extractor(
         out_path = f.name
 
     cmd: List[str] = [
-        sys.executable, str(script), linkedin_url,
+        sys.executable, str(script), normalized_url,  # Use normalized_url
         "--email", email, "--password", password,
         "--output", out_path,
     ]
@@ -232,7 +190,10 @@ def linkedin_profile_extractor(
         run = subprocess.run(cmd, check=True, capture_output=True, text=True)
         # Read file written by the scraper
         with open(out_path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
+            # Update the URL in the returned data to the normalized version
+            data["url"] = normalized_url
+            return data
     except subprocess.CalledProcessError as e:
         return {"error": f"scraper failed: {e.stderr or e.stdout or str(e)}"}
     except Exception as e:
@@ -250,6 +211,7 @@ def generic_profile() -> dict:
         "location": "United States (metro area)",
         "url": None,
     }
+
 
 def nl_to_json_extractor(text: str) -> dict:
     """
@@ -319,11 +281,12 @@ def nl_to_json_extractor(text: str) -> dict:
         if m: loc = m.group(2).strip()
         return {
             "name": None,
-            "position": None,            # don’t force “Recruiter” here
+            "position": None,
             "company": comp,
             "location": loc,
             "url": None,
         }
+
 
 # ------------------ High-level builder ------------------
 
@@ -374,9 +337,52 @@ def build_profile(input_data: dict) -> dict:
 # ===============   ADK-friendly tool wrappers   =============
 # ============================================================
 
+def google_search(query: str, num_results: int = 5) -> Dict[str, Any]:
+    """
+    Perform a Google search to get current information.
+    Useful when agents need to verify facts or get recent company info.
+    """
+    try:
+        from googlesearch import search
+
+        results = []
+        search_results = search(query, num_results=num_results, sleep_interval=1)
+
+        for i, url in enumerate(search_results):
+            if i >= num_results:
+                break
+            results.append({
+                "title": f"Result {i + 1}",
+                "url": url,
+                "snippet": f"Search result for: {query}"
+            })
+
+        return {
+            "status": "success",
+            "query": query,
+            "results": results,
+            "count": len(results)
+        }
+
+    except ImportError:
+        # Fallback if googlesearch package isn't installed
+        return {
+            "status": "error",
+            "message": "Google search not available. Install with: pip install googlesearch-python",
+            "fallback_advice": f"For query '{query}', suggest checking the company's official website, LinkedIn, or recent news articles."
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Search failed: {str(e)}",
+            "query": query
+        }
+
+
 def ping() -> Dict[str, Any]:
     """Simple smoke test tool so you can verify calls work in the dev UI."""
     return {"ok": True, "message": "pong"}
+
 
 def parse_qr_b64(image_b64: str, mime_type: str = "image/png") -> Dict[str, Any]:
     """
@@ -388,15 +394,16 @@ def parse_qr_b64(image_b64: str, mime_type: str = "image/png") -> Dict[str, Any]
         return {"status": "error", "message": f"Invalid base64: {e}"}
     return qr_to_vcard_or_url(image_bytes=image_bytes, mime_type=mime_type)
 
+
 def build_profile_from_inputs(
-    image_b64: Optional[str] = None,
-    linkedin_url: Optional[str] = None,
-    preferences: Optional[str] = None,
-    email: Optional[str] = None,
-    password: Optional[str] = None,
-    headless: bool = True,
-    chromedriver: Optional[str] = None,
-    mime_type: str = "image/png",
+        image_b64: Optional[str] = None,
+        linkedin_url: Optional[str] = None,
+        preferences: Optional[str] = None,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
+        headless: bool = True,
+        chromedriver: Optional[str] = None,
+        mime_type: str = "image/png",
 ) -> Dict[str, Any]:
     """
     Unified entrypoint: provide any of image_b64, linkedin_url, or preferences.
@@ -417,9 +424,14 @@ def build_profile_from_inputs(
             return {"error": f"Invalid base64 image: {e}"}
     return build_profile(payload)
 
+
 def render_prompt_from_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     return render_prompt_from_json(profile or {})
 
+
+# ============================================================
+# =============   STATE-BASED AGENT COMMUNICATION   ==========
+# ============================================================
 
 def broadcast_prompt_to_agents(prompt_dict: dict, state: dict) -> str:
     """
@@ -455,6 +467,7 @@ def broadcast_prompt_to_agents(prompt_dict: dict, state: dict) -> str:
 
     return f"✅ Prompt broadcasted to persona_agent and coach_agent!\n\nPersona: {profile_name} at {profile_company}\n\nBoth agents now have access to the new persona instructions via shared state."
 
+
 # ============================================================
 # =====================    root_agent    =====================
 # ============================================================
@@ -481,6 +494,7 @@ root_agent = Agent(
         "→ Call build_profile_from_inputs(preferences=...)\n"
         "→ Call render_prompt_from_profile(profile=...)\n"
         "→ Call broadcast_prompt_to_agents(prompt_dict=...)\n\n"
+        "If you need current information about a company or role, use google_search.\n"
         "Always complete the full pipeline: input → profile → prompt → broadcast."
     ),
     tools=[
@@ -488,6 +502,7 @@ root_agent = Agent(
         build_profile_from_inputs,
         render_prompt_from_profile,
         broadcast_prompt_to_agents,
+        google_search,
         generic_profile,
         ping,
     ],
